@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv/
+env/
+*.log # Ignore the generated log files from the script
+*.swp # vim swap files
+
+# v4l2loopback build artifacts
+v4l2loopback/
+*.ko
+modules.order
+Module.symvers
