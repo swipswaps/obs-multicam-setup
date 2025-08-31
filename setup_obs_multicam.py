@@ -24,6 +24,7 @@ import getpass
 import grp
 import shutil
 import datetime # For unique log filenames
+import re # For improved grep patterns
 from typing import List, Tuple, Optional
 
 # ---------------------------
@@ -55,6 +56,7 @@ SYSTEM_PACKAGES = [
     "v4l2-utils", # For v4l2-ctl
     "gstreamer1-plugins-good", # For gst-launch-1.0
     "pipewire-utils", # For pw-cli
+    "rpm-build", # Needed for kernel-devel checks, often part of general build tools
 ]
 PYTHON_DEPS = ["requests", "json5", "pyyaml"]
 
@@ -184,19 +186,33 @@ def run_live(cmd: List[str], cwd: str | None = None, env: dict | None = None, ti
 def run_quiet(cmd: List[str], allow_fail: bool = True, description: str = "command") -> Tuple[int, str]:
     """
     Run a short command without streaming; return (rc, output).
-    Includes improved feedback to prevent perceived stalling.
+    Includes improved feedback to prevent perceived stalling and
+    only prints substantial output for failures or explicit warnings.
     """
     cmd_str = ' '.join(cmd)
     info(f"Executing '{description}': {cmd_str} (this might take a moment)...")
     try:
         out = subprocess.run(cmd, check=not allow_fail, capture_output=True, text=True)
         combined_output = out.stdout + out.stderr
+        
         if out.returncode != 0:
             warn(f"'{description}' failed with code {out.returncode}:\nOutput:\n{combined_output.strip()}")
+        # Check for explicitly problematic keywords in output even on success
+        elif combined_output.strip() and (
+            "error" in combined_output.lower() or
+            "warn" in combined_output.lower() or
+            "fail" in combined_output.lower() or
+            "permission denied" in combined_output.lower() or
+            "not found" in combined_output.lower()
+        ):
+            info(f"'{description}' completed successfully but with notable output:\n{combined_output.strip()}")
         elif combined_output.strip():
-            info(f"'{description}' completed successfully. Output:\n{combined_output.strip()}")
+            # If there's output but it's not explicitly an error/warning, it's just verbose info.
+            # We don't need to print the full output to the console for this, as it's in the log.
+            info(f"'{description}' completed successfully with minor informational output.")
         else:
-            info(f"'{description}' completed successfully with no output.")
+            info(f"'{description}' completed successfully with no relevant output.")
+        
         return out.returncode, combined_output
     except FileNotFoundError:
         warn(f"'{description}' command not found: {cmd[0]}")
@@ -284,7 +300,13 @@ def ensure_video_group_membership() -> bool:
     info(f"User '{user}' is not in 'video' group. Adding now (requires sudo)...")
     rc, _ = run_live(["sudo", "usermod", "-aG", "video", user], allow_fail=True)
     if rc == 0:
-        warn("You must fully log out and log back in (or reboot) for 'video' group membership to take effect in your desktop session.")
+        warn("************************************************************************************")
+        warn("** IMPORTANT: You must fully LOG OUT and LOG BACK IN (or reboot)                  **")
+        warn("** for 'video' group membership to take effect in your desktop session.           **")
+        warn("** Applications like OBS will not see your cameras until this is done.            **")
+        warn("************************************************************************************")
+        info("For advanced users: you can test 'video' group permissions in the *current* terminal")
+        info("session by running 'newgrp video', but a full desktop session relogin is generally safer.")
         return True  # relogin likely required
     else:
         error(f"Failed to add user '{user}' to 'video' group.")
@@ -324,7 +346,6 @@ def find_dbus_unit_for_service(dbus_service_name: str, scope: str) -> Optional[s
         search_paths.append("/etc/systemd/system/")
         search_paths.append("/usr/lib/systemd/system/")
     
-    # Grep only for .service files to avoid unnecessary searches and errors on other file types
     service_files_to_grep = []
     for path_dir in search_paths:
         if os.path.isdir(path_dir):
@@ -337,20 +358,59 @@ def find_dbus_unit_for_service(dbus_service_name: str, scope: str) -> Optional[s
                 
     if service_files_to_grep:
         info(f"Attempting to grep {len(service_files_to_grep)} systemd unit files for D-Bus service name '{dbus_service_name}'...")
-        # Use a more precise regex to find BusName= or D-Bus activated services within unit files
-        # It needs to match 'BusName=org.freedesktop.impl.portal.PermissionStore' or a similar pattern.
-        # The regex also accounts for potential quotes or comments.
-        grep_pattern = fr"^(BusName|ExecStart|D-BusService)=\s*\"?{dbus_service_name.replace('.', r'\.')}(\.service)?\"?(?:\s*|#.*)?$"
-        grep_cmd = ["grep", "-lE", grep_pattern] + service_files_to_grep
+        
+        # Primary pattern: Direct match of BusName= or D-BusService=
+        main_pattern = fr"^(BusName|D-BusService)=\s*\"?{dbus_service_name.replace('.', r'\.')}(\.service)?\"?(?:\s*|#.*)?$"
+        
+        # Additional patterns for common portal/accessibility executables, if the D-Bus service name hints at them
+        additional_grep_patterns = []
+        if dbus_service_name == "org.freedesktop.impl.portal.PermissionStore":
+            # xdg-desktop-portal service typically activates this indirectly
+            additional_grep_patterns.append(r"ExecStart=.*?/usr/(libexec|bin)/xdg-desktop-portal")
+        elif dbus_service_name == "org.a11y.Bus":
+            # at-spi-bus-launcher for accessibility bus
+            additional_grep_patterns.append(r"ExecStart=.*?at-spi-bus-launcher")
+
+        # Combine patterns with OR for grep -E
+        if additional_grep_patterns:
+            # Ensure the combined pattern correctly escapes and groups
+            combined_grep_pattern = f"({main_pattern}|{'|'.join(additional_grep_patterns)})"
+        else:
+            combined_grep_pattern = main_pattern
+
+        grep_cmd = ["grep", "-lE", combined_grep_pattern] + service_files_to_grep
         
         rc_grep, grep_output = run_quiet(grep_cmd, allow_fail=True, description=f"grepping unit files for {dbus_service_name}")
         
         if rc_grep == 0 and grep_output.strip():
-            # Get the first matching unit file and extract its name
-            unit_file_path = grep_output.splitlines()[0].strip()
-            unit_name = os.path.basename(unit_file_path)
-            info(f"Found candidate unit '{unit_name}' by grepping unit file '{unit_file_path}' for D-Bus service '{dbus_service_name}'.")
-            return unit_name
+            unit_file_paths = grep_output.splitlines()
+            unit_name_candidate = None
+
+            if len(unit_file_paths) > 1:
+                info(f"Multiple candidate units found by grepping for D-Bus service '{dbus_service_name}': {unit_file_paths}")
+                # Try to find the best match by explicitly checking BusName property
+                best_match = None
+                for path in unit_file_paths:
+                    candidate_unit_name = os.path.basename(path)
+                    cmd_check_busname = ["systemctl"]
+                    if scope: cmd_check_busname.append(scope)
+                    cmd_check_busname.extend(["show", candidate_unit_name, "--property=BusName", "--value"])
+                    rc_busname, busname_output = run_quiet(cmd_check_busname, allow_fail=True, description=f"checking BusName for {candidate_unit_name}")
+                    if rc_busname == 0 and dbus_service_name in busname_output.strip():
+                        best_match = candidate_unit_name
+                        info(f"Refined match: Candidate '{best_match}' explicitly declares BusName '{dbus_service_name}'.")
+                        break # Found a strong, explicit match
+                
+                if best_match:
+                    unit_name_candidate = best_match
+                else:
+                    unit_name_candidate = os.path.basename(unit_file_paths[0]) # Fallback to first if no explicit BusName match
+                    warn(f"No strong BusName match among multiple grep candidates. Falling back to first: '{unit_name_candidate}'.")
+            else:
+                unit_name_candidate = os.path.basename(unit_file_paths[0])
+            
+            info(f"Found candidate unit '{unit_name_candidate}' by grepping unit file '{unit_file_paths[0]}' for D-Bus service '{dbus_service_name}'.")
+            return unit_name_candidate
     
     # Strategy 3: Heuristic for common unit names (final fallback if direct search/grep fails)
     common_unit_names: List[str] = []
@@ -500,12 +560,32 @@ def build_and_install_v4l2loopback():
     """
     kernel_ver = detect_kernel_version()
     
+    # Pre-check for kernel-devel package (Future Improvement)
+    info("Checking for required kernel-devel package matching the running kernel...")
+    kernel_devel_pkg = f"kernel-devel-{kernel_ver}"
+    rc_rpm, rpm_output = run_quiet(["rpm", "-q", kernel_devel_pkg], allow_fail=True, description=f"checking '{kernel_devel_pkg}'")
+    if rc_rpm != 0 or "not installed" in rpm_output.lower():
+        error(f"The essential package '{kernel_devel_pkg}' is not installed or does not match your running kernel.")
+        warn("This package is crucial for building kernel modules like v4l2loopback from source.")
+        warn(f"Please ensure it's installed. You might need to run: sudo dnf install {kernel_devel_pkg}")
+        # Attempt to install it again, if the dnf install step before somehow missed it.
+        # This makes the script more resilient but a hard fail here is also valid if dnf already ran.
+        info(f"Attempting to install '{kernel_devel_pkg}' again via dnf...")
+        run_live(["sudo", "dnf", "install", "-y", "--allowerasing", "--skip-broken", "--skip-unavailable", kernel_devel_pkg], allow_fail=True)
+        rc_rpm_recheck, rpm_output_recheck = run_quiet(["rpm", "-q", kernel_devel_pkg], allow_fail=True, description=f"re-checking '{kernel_devel_pkg}'")
+        if rc_rpm_recheck != 0 or "not installed" in rpm_output_recheck.lower():
+            error(f"Failed to ensure '{kernel_devel_pkg}' is installed. Skipping v4l2loopback build.")
+            return # Skip build if kernel-devel is still missing
+    info(f"'{kernel_devel_pkg}' is installed. Proceeding with v4l2loopback checks.")
+
+
     # Check if the kmod-v4l2loopback package already provides the module for the current kernel
-    # This is often installed by default on Fedora.
-    info("Checking if kmod-v4l2loopback provides the module for the current kernel...")
+    # (Clarity on modinfo vs. modprobe - Future Improvement)
+    info(f"Checking if v4l2loopback module *file* is present for kernel {kernel_ver}...")
     rc, _ = run_quiet(["modinfo", "v4l2loopback"], allow_fail=True, description="modinfo v4l2loopback")
     if rc == 0:
-        info(f"v4l2loopback module found via modinfo. Assuming packaged version is sufficient for kernel {kernel_ver}.")
+        info(f"v4l2loopback module *file* found via modinfo. This confirms the module exists for kernel {kernel_ver}.")
+        info("The script will still attempt to load it with modprobe later, but building from source is not needed.")
         return
 
     warn(f"v4l2loopback module not found or not loaded for current kernel {kernel_ver}. Attempting to build from source.")
@@ -671,12 +751,13 @@ def test_capture_device(device_path: str) -> bool:
     """
     Attempts to test a video capture device using ffplay or gst-launch-1.0.
     Returns True if successful, False otherwise.
+    (Explicit Warning for Graphical Test Windows - Future Improvement)
     """
-    info(f"Attempting to test video capture for {device_path}...")
+    info(f"Attempting to test video capture for {device_path} (this may open a temporary graphical window for ~5 seconds)...")
     
     # Try ffplay first
     if check_command_exists("ffplay"):
-        info(f"Trying ffplay {device_path} (will attempt to run for 5 seconds)...")
+        info(f"Trying ffplay {device_path}...")
         try:
             # Use Popen to control timeout and prevent hanging
             proc = subprocess.Popen(["ffplay", "-loglevel", "quiet", "-t", "5", device_path],
@@ -699,7 +780,7 @@ def test_capture_device(device_path: str) -> bool:
     
     # Fallback to gst-launch-1.0
     if check_command_exists("gst-launch-1.0"):
-        info(f"Trying gst-launch-1.0 v4l2src device={device_path} ! autovideosink (will attempt to run for 5 seconds)...")
+        info(f"Trying gst-launch-1.0 v4l2src device={device_path} ! autovideosink...")
         try:
             proc = subprocess.Popen(["gst-launch-1.0", "v4l2src", f"device={device_path}", "!", "autovideosink"],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -770,7 +851,7 @@ def check_journalctl_pipewire_errors():
 
 
 # ---------------------------
-# Troubleshooting output (moved up for definition order)
+# Troubleshooting output
 # ---------------------------
 def print_troubleshooting(had_virtual_device: bool, pipewire_ok: bool, physical_devs: List[str], video_group_needs_relogin: bool, current_log_filename: str):
     print("\n" + "="*60)
@@ -791,8 +872,11 @@ def print_troubleshooting(had_virtual_device: bool, pipewire_ok: bool, physical_
         info("\nPhysical cameras detected. If OBS still shows 'No capture sources available', here's what was attempted:")
         
         if video_group_needs_relogin:
-            warn("User needs to log out and log back in (or reboot) for 'video' group membership to take effect.")
-            warn("This script cannot automate a relogin/reboot. Please do this manually and re-run the script after.")
+            warn("************************************************************************************")
+            warn("** CRITICAL: You must LOG OUT and LOG BACK IN (or reboot) for 'video' group     **")
+            warn("** membership to take effect. This script cannot automate a relogin/reboot.     **")
+            warn("** Please do this manually, then re-run this script to confirm all is well.     **")
+            warn("************************************************************************************")
         else:
             info("User is already in 'video' group. No relogin needed for group membership.")
 
